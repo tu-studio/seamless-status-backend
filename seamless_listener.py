@@ -4,6 +4,11 @@ from oscpy.server import OSCThreadServer, ServerClass
 import signal
 from dataclasses import dataclass, field
 from typing import Callable, List, Coroutine
+import logging
+from threading import Timer
+
+log = logging.getLogger()
+
 
 
 n_renderers = 3
@@ -18,6 +23,27 @@ class Source:
     gain: List[float] = field(default_factory=lambda: [0.0 for i in range(n_renderers)])
 
 
+class Watchdog(Exception):
+    def __init__(self, timeout, userHandler=None):  # timeout in seconds
+        self.timeout = timeout
+        self.handler = userHandler if userHandler is not None else self.defaultHandler
+        
+
+    def start(self):
+        self.timer = Timer(self.timeout, self.handler)
+        self.timer.start()
+
+    def reset(self):
+        self.timer.cancel()
+        self.timer = Timer(self.timeout, self.handler)
+        self.timer.start()
+
+    def stop(self):
+        self.timer.cancel()
+
+    def defaultHandler(self):
+        raise self
+
 @ServerClass
 class SeamlessListener:
     def __init__(
@@ -28,8 +54,8 @@ class SeamlessListener:
         osc_kreuz_hostname,
         osc_kreuz_port,
         name="seamless_status",
+        reconnect_timeout=5,
     ) -> None:
-
         self.name = name
         self.listen_ip = listen_ip
         self.listen_port = listen_port
@@ -38,12 +64,7 @@ class SeamlessListener:
 
         self.sources = [Source(idx=i) for i in range(n_sources)]
         self.osc = OSCThreadServer()
-
-        self.osc.listen(self.listen_ip, self.listen_port, True)
-
-        self.osc.bind(b"/oscrouter/ping", self.pong)
-        self.osc.bind(b"/source/xyz", self.receive_xyz)
-        self.osc.bind(b"/source/send", self.receive_gain)
+        self.reconnect_timer = Watchdog(reconnect_timeout, self.subscribe_to_osc_kreuz)
         self.asyncio_event_loop: None | AbstractEventLoop = None
 
         self.position_callback: (
@@ -51,10 +72,19 @@ class SeamlessListener:
         ) = None
         self.gain_callback: NoneType | Callable[[int, int, float], Coroutine] = None
 
-        self.subscribe_to_osc_kreuz()
 
     # TODO reinitialize if no ping for x Seconds
 
+
+    def start_listening(self):
+        self.osc.listen(self.listen_ip, self.listen_port, True)
+        self.osc.bind(b"/oscrouter/ping", self.pong)
+        self.osc.bind(b"/source/xyz", self.receive_xyz)
+        self.osc.bind(b"/source/send", self.receive_gain)
+
+        self.subscribe_to_osc_kreuz()
+
+    
     def send_full_positions(self):
         # TODO use seperate callback maybe?
         for source in self.sources:
@@ -70,6 +100,7 @@ class SeamlessListener:
         self.gain_callback = callback
 
     def pong(self, *values):
+        self.reconnect_timer.reset()
         self.osc.send_message(
             b"/oscrouter/pong",
             (self.name.encode(),),
@@ -108,20 +139,31 @@ class SeamlessListener:
             )
 
     def subscribe_to_osc_kreuz(self):
+        logging.info(f"sending subscribe message to {self.name}:{self.listen_port}")
+        print(f"sending subscribe message to {self.osc_kreuz_hostname}:{self.osc_kreuz_port}")
         self.osc.send_message(
             "/oscrouter/subscribe".encode(),
-            [self.name.encode(), self.listen_port, b"xyz", 0, 5],
+            [self.name.encode(), self.listen_port, b"xyz", 0, 1],
             self.osc_kreuz_hostname,
             self.osc_kreuz_port,
         )
+        self.reconnect_timer.start()
 
     def unsubscribe_from_osc_kreuz(self):
-        self.osc.send_message(
-            b"/oscrouter/unsubscribe",
-            [self.name.encode()],
-            self.osc_kreuz_hostname,
-            self.osc_kreuz_port,
-        )
+        try:
+            self.osc.send_message(
+                b"/oscrouter/unsubscribe",
+                [self.name.encode()],
+                self.osc_kreuz_hostname,
+                self.osc_kreuz_port,
+            )
+            
+            self.reconnect_timer.stop()
+            self.osc.close()
+
+        except (RuntimeError, AttributeError):
+            # handle shutdowns in dev mode of fastapi
+            pass
 
     def __del__(self):
         self.unsubscribe_from_osc_kreuz()
