@@ -8,7 +8,7 @@ from pythonosc.dispatcher import Dispatcher
 from pythonosc.udp_client import SimpleUDPClient
 import signal
 from dataclasses import dataclass, field
-from typing import Callable, List, Coroutine
+from typing import Any, Callable, List, Coroutine
 import logging
 from threading import Timer
 
@@ -25,6 +25,16 @@ class Source:
     y: float = 0
     z: float = 0
     gain: List[float] = field(default_factory=lambda: [0.0 for i in range(n_renderers)])
+
+
+@dataclass
+class Point3D:
+    x: float
+    y: float
+    z: float
+
+    def to_dict(self):
+        return {"x": self.x, "y": self.y, "z": self.z}
 
 
 class Watchdog(Exception):
@@ -59,6 +69,7 @@ class SeamlessListener:
         name="seamless_status",
         reconnect_timeout=5,
     ) -> None:
+
         self.name = name
         self.listen_ip = listen_ip
         self.listen_port = listen_port
@@ -66,6 +77,9 @@ class SeamlessListener:
         self.osc_kreuz_port = osc_kreuz_port
 
         self.sources = [Source(idx=i) for i in range(n_sources)]
+        self.room_name: str = ""
+        self.polygon: list[Point3D] = []
+
         self.osc_dispatcher = Dispatcher()
 
         self.osc_client = SimpleUDPClient(self.osc_kreuz_hostname, self.osc_kreuz_port)
@@ -73,10 +87,12 @@ class SeamlessListener:
         self.asyncio_event_loop: None | AbstractEventLoop = None
 
         self.position_callback: (
-            NoneType | Callable[[int, float, float, float], Coroutine]
+            None | Callable[[int, float, float, float], Coroutine]
         ) = None
-        self.gain_callback: NoneType | Callable[[int, int, float], Coroutine] = None
-
+        self.gain_callback: None | Callable[[int, int, float], Coroutine] = None
+        self.polygon_callback: None | Callable[[str, list[Point3D]], Coroutine] = None
+        # TODO do something with this
+        self.attribute_callback: None | Callable[[str, Any], Coroutine] = None
         self.transport: BaseTransport | None = None
 
     # TODO reinitialize if no ping for x Seconds
@@ -85,6 +101,8 @@ class SeamlessListener:
         self.osc_dispatcher.map("/oscrouter/ping", self.pong)
         self.osc_dispatcher.map("/source/xyz", self.receive_xyz)
         self.osc_dispatcher.map("/source/send", self.receive_gain)
+        self.osc_dispatcher.map("/room/polygon", self.receive_polygon)
+
         self.osc_dispatcher.set_default_handler(self.default_osc_handler)
         self.asyncio_event_loop = asyncio.get_running_loop()
         self.osc = AsyncIOOSCUDPServer(
@@ -108,6 +126,11 @@ class SeamlessListener:
 
     def register_gain_callback(self, callback: Callable[[int, int, float], Coroutine]):
         self.gain_callback = callback
+
+    def register_polygon_callback(
+        self, callback: Callable[[str, list[Point3D]], Coroutine]
+    ):
+        self.polygon_callback = callback
 
     def pong(self, path, *values):
         self.reconnect_timer.reset()
@@ -153,6 +176,28 @@ class SeamlessListener:
                 self.gain_callback(source_id, renderer_id, gain)
             )
 
+    def receive_polygon(self, path, room_name: str, n_points: int, *values):
+        self.room_name = room_name
+        if len(values) / n_points != 3:
+            logging.error("receive polygon is wrong size")
+            return
+
+        self.polygon = []
+        for i in range(n_points):
+            base_index = i * 3
+            self.polygon.append(
+                Point3D(
+                    values[base_index], values[base_index + 1], values[base_index + 2]
+                )
+            )
+
+        if len(self.polygon) > 1:
+            self.polygon.append(self.polygon[0])
+        if self.asyncio_event_loop is not None and self.polygon_callback is not None:
+            self.asyncio_event_loop.create_task(
+                self.polygon_callback(room_name, self.polygon)
+            )
+
     def subscribe_to_osc_kreuz(self):
         logging.info(f"sending subscribe message to {self.name}:{self.listen_port}")
         print(
@@ -160,7 +205,7 @@ class SeamlessListener:
         )
         self.osc_client.send_message(
             "/osckreuz/subscribe",
-            [self.name, self.listen_port, "xyz", 0, 50],
+            [self.name, self.listen_port, "xyz", 0, 10],
         )
         self.reconnect_timer.start()
 

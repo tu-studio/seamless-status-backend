@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
-from seamless_listener import SeamlessListener
+from seamless_listener import Point3D, SeamlessListener
 import asyncio
 from pydantic import BaseModel
 import click
@@ -62,6 +62,12 @@ class ConnectionManager:
                     "gains": source.gain,
                 }
             )
+        await websocket.send_json(
+            {
+                "room_name": seamless_listener.room_name,
+                "polygon": [p.to_dict() for p in seamless_listener.polygon],
+            }
+        )
 
     def disconnect(self, websocket: WebSocket):
         self.active_connections.remove(websocket)
@@ -79,6 +85,13 @@ class ConnectionManager:
         for connection in self.active_connections:
             await connection.send_json(
                 {"id": source_id, "renderer_id": renderer_id, "renderer_gain": gain}
+            )
+
+    async def send_polygon_update(self, room_name: str, polygon: list[Point3D]):
+        print(polygon)
+        for connection in self.active_connections:
+            await connection.send_json(
+                {"room_name": room_name, "polygon": [p.to_dict() for p in polygon]}
             )
 
     async def broadcast(self, message: str):
@@ -194,7 +207,7 @@ def main(
 
     seamless_listener.register_position_callback(manager.send_position_update)
     seamless_listener.register_gain_callback(manager.send_gain_update)
-
+    seamless_listener.register_polygon_callback(manager.send_polygon_update)
     import uvicorn
 
     uvicorn.run(app, host=ip, port=api_port)
