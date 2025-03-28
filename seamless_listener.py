@@ -205,7 +205,7 @@ class SeamlessListener:
         )
         self.osc_client.send_message(
             "/osckreuz/subscribe",
-            [self.name, self.listen_port, "xyz", 0, 10],
+            [self.name, self.listen_port, "xyz", 0, 0],
         )
         self.reconnect_timer.start()
 
